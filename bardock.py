@@ -1,281 +1,145 @@
 # bot.py
 import os
-import re
 import asyncio
-import logging
-from datetime import datetime, timedelta, timezone
-from collections import deque, defaultdict
-from threading import Thread
-
 import nextcord
 from nextcord.ext import commands
 from flask import Flask
+import threading
+import re
+import time
 
-# -----------------------
+# -----------------------------
 # CONFIG
-# -----------------------
-TOKEN = os.environ.get("TOKEN")
-PORT = int(os.environ.get("PORT", 5000))
+# -----------------------------
+TOKEN = os.getenv("TOKEN")
+INTENTS = nextcord.Intents.all()
+BOT = commands.Bot(command_prefix="!", intents=INTENTS)
 
-# Immune role
-IMMUNE_ROLE_ID = 1436371868507439205
+IMMUNE_ROLE = 1436371868507439205
+IMMUNE_USER = 1338875321545392152  # immune owner
 
-# Bardock image URL
-BARD0CK_ICON = "https://cdn.discordapp.com/attachments/1371058100462948438/1446739720456634368/EjodqurX0AYCUP-.jpg?ex=693514dc&is=6933c35c&hm=b704945cd6fe32c50ddcf3d7be68d50e58ad709a120e8253088128929f8c6e9b&"
+EMOJI_REGEX = re.compile(r"[\U0001F300-\U0001FAFF]")
+LINK_REGEX = re.compile(r"https?://[^\s]+")
 
-# Anti settings
-EMOJI_THRESHOLD = 5
-SPAM_MSG_THRESHOLD = 5
-SPAM_WINDOW_SECONDS = 10
-LONGTEXT_THRESHOLD = 500
+SPAM_TRACKER = {}  # {user_id: [timestamps]}
 
-TIMEOUT_SECONDS_FOR_SPAM = 60 * 5
-TIMEOUT_SECONDS_FOR_LONGTEXT = 60 * 10
-TIMEOUT_SECONDS_FOR_EMOJI = 60 * 2
-TIMEOUT_SECONDS_FOR_LINK = 60 * 5
-
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("BardockGuardian")
-
-intents = nextcord.Intents.default()
-intents.message_content = True
-intents.members = True
-intents.guilds = True
-
-bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
-
-user_message_times = defaultdict(lambda: deque(maxlen=100))
-
-# Regex
-URL_REGEX = re.compile(r"(https?://[^\s]+)|(www\.[^\s]+)", re.IGNORECASE)
-CUSTOM_EMOJI_REGEX = re.compile(r"<a?:\w+:\d+>")
-UNICODE_EMOJI_REGEX = re.compile(
-    "[" 
-    "\U0001F300-\U0001F6FF"
-    "\U0001F900-\U0001F9FF"
-    "\U0001F1E6-\U0001F1FF"
-    "\u2600-\u26FF"
-    "\u2700-\u27BF"
-    "]"
-)
-
-
-def count_emojis(text: str) -> int:
-    return len(CUSTOM_EMOJI_REGEX.findall(text)) + len(UNICODE_EMOJI_REGEX.findall(text))
-
-
-def has_non_tenor_link(text: str):
-    for match in URL_REGEX.finditer(text):
-        url = match.group(0).lower()
-        if "tenor.com" in url or "tenor.googleapis.com" in url:
-            continue
-        return True, match.group(0)
-    return False, ""
-
-
-async def majestic_dm(member, reason, details=""):
-    """Bardock DM message"""
-    msg = (
-        f"**Oi, {member.display_name}. Bardock speaking.**\n\n"
-        f"{reason}\n\n"
-        f"{details}\n\n"
-        "You're stronger than this. Fight with control — not chaos. ⚔️🔥"
-    )
-
-    try:
-        await member.send(msg)
-    except:
-        log.warning(f"Couldn't DM {member}")
-
-
-async def apply_timeout(guild, member, seconds, reason):
-    try:
-        until = datetime.now(timezone.utc) + timedelta(seconds=seconds)
-        await member.edit(communication_disabled_until=until, reason=reason)
-    except Exception as e:
-        log.exception(f"Timeout failed for {member}: {e}")
-
-
+# -----------------------------
+# HELPER — CHECK IMMUNITY
+# -----------------------------
 def is_immune(member):
-    try:
-        if member.guild_permissions.administrator:
-            return True
-        for r in member.roles:
-            if r.id == IMMUNE_ROLE_ID:
-                return True
-    except:
-        pass
+    if member.id == IMMUNE_USER:
+        return True
+    if any(role.id == IMMUNE_ROLE for role in member.roles):
+        return True
     return False
 
+# -----------------------------
+# BARDock DM Messages
+# -----------------------------
+def bardock_msg(reason):
+    return (
+        f"**Warrior… Bardock speaks.**\n"
+        f"You walk a path that invites chaos — and I don’t tolerate that.\n\n"
+        f"**Your mistake:** {reason}\n\n"
+        f"Stand firm, correct yourself, and don’t force my hand again.\n"
+        f"**A Saiyan rises through discipline — not recklessness.**"
+    )
 
-# -----------------------
-# EVENTS
-# -----------------------
-@bot.event
+# -----------------------------
+# EVENT LISTENER
+# -----------------------------
+@BOT.event
 async def on_ready():
-    log.info(f"Bardock Bot Online — {bot.user}")
+    print(f"⚔️ BardockBot online as {BOT.user}")
 
-
-@bot.event
+@BOT.event
 async def on_message(message):
-    await bot.process_commands(message)
-
-    if message.author.bot or message.guild is None:
+    if message.author.bot:
         return
 
-    member = message.author
-    guild = message.guild
+    author = message.author
     content = message.content or ""
 
-    if is_immune(member):
+    # --------------------------
+    # IMMUNITY CHECK
+    # --------------------------
+    if is_immune(author):
+        await BOT.process_commands(message)
         return
 
-    # -----------------------
-    # Anti-longtext
-    # -----------------------
-    if len(content) >= LONGTEXT_THRESHOLD:
-        try: await message.delete()
-        except: pass
-
-        await apply_timeout(guild, member, TIMEOUT_SECONDS_FOR_LONGTEXT, "Longtext rule")
-
-        await majestic_dm(
-            member,
-            "You're dropping massive walls of text in the middle of a battlefield.",
-            f"Your message had **{len(content)} characters**, allowed max is **{LONGTEXT_THRESHOLD}**."
-        )
-        return
-
-    # -----------------------
-    # Anti-emoji spam
-    # -----------------------
-    emoji_count = count_emojis(content)
-    if emoji_count >= EMOJI_THRESHOLD:
-        try: await message.delete()
-        except: pass
-
-        await apply_timeout(guild, member, TIMEOUT_SECONDS_FOR_EMOJI, "Emoji spam")
-
-        await majestic_dm(
-            member,
-            "That message was nothing but emoji noise.",
-            f"Detected **{emoji_count} emojis** (limit is {EMOJI_THRESHOLD})."
-        )
-        return
-
-    # -----------------------
-    # Anti-links
-    # -----------------------
-    has_bad, bad_link = has_non_tenor_link(content)
-    if has_bad:
-        try: await message.delete()
-        except: pass
-
-        await apply_timeout(guild, member, TIMEOUT_SECONDS_FOR_LINK, "Illegal link")
-
-        await majestic_dm(
-            member,
-            "You posted a link that doesn't belong in this server.",
-            f"**{bad_link}** is blocked. Only **Tenor** links are allowed."
-        )
-        return
-
-    # -----------------------
-    # Anti-spam
-    # -----------------------
-    now = datetime.now().timestamp()
-    times = user_message_times[(guild.id, member.id)]
-    times.append(now)
-
-    while times and now - times[0] > SPAM_WINDOW_SECONDS:
-        times.popleft()
-
-    if len(times) >= SPAM_MSG_THRESHOLD:
-        # Delete recent messages
+    # --------------------------
+    # ANTI-EMOJI SPAM
+    # --------------------------
+    emoji_count = len(EMOJI_REGEX.findall(content))
+    if emoji_count >= 5:
         try:
-            def check(m):
-                return (
-                    m.author.id == member.id and
-                    datetime.now().timestamp() - m.created_at.replace(tzinfo=timezone.utc).timestamp() <= SPAM_WINDOW_SECONDS
-                )
-            await message.channel.purge(limit=50, check=check)
+            await message.delete()
+            await author.send(bardock_msg("Excessive emoji usage."))
         except:
             pass
 
-        await apply_timeout(guild, member, TIMEOUT_SECONDS_FOR_SPAM, "Spam")
+    # --------------------------
+    # ANTI-LINK (except tenor)
+    # --------------------------
+    links = LINK_REGEX.findall(content)
+    for link in links:
+        if "tenor.com" not in link:
+            try:
+                await message.delete()
+                await author.send(bardock_msg("Unauthorized link detected."))
+            except:
+                pass
+            break  # delete once per message
 
-        embed = nextcord.Embed(
-            title="⚔️ Bardock's Warning",
-            description=(
-                f"{member.mention}, you're firing off messages like you're losing control.\n"
-                f"I counted **{len(times)} messages in {SPAM_WINDOW_SECONDS} seconds**."
-            ),
-            color=0xFF4500
-        )
-        embed.add_field(
-            name="Punishment",
-            value=f"🔇 Timeout: **{TIMEOUT_SECONDS_FOR_SPAM // 60} minutes**"
-        )
-        embed.set_author(name="Bardock", icon_url=BARD0CK_ICON)
-
+    # --------------------------
+    # ANTI-LONGTEXT
+    # --------------------------
+    if len(content) >= 500:
         try:
-            await message.channel.send(embed=embed)
+            await message.delete()
+            await author.timeout(nextcord.utils.utcnow() + nextcord.utils.timedelta(seconds=30))
+            await author.send(bardock_msg("Message too long — over 500 characters."))
         except:
             pass
 
-        await majestic_dm(
-            member,
-            "You're spamming like you're panicking in combat.",
-            f"Sent **{len(times)} messages** in {SPAM_WINDOW_SECONDS}s. Timeout applied."
-        )
+    # --------------------------
+    # ANTI-SPAM (5+ messages/10s)
+    # --------------------------
+    now = time.time()
+    if author.id not in SPAM_TRACKER:
+        SPAM_TRACKER[author.id] = []
 
-        user_message_times[(guild.id, member.id)].clear()
-        return
+    SPAM_TRACKER[author.id] = [t for t in SPAM_TRACKER[author.id] if now - t <= 10]
+    SPAM_TRACKER[author.id].append(now)
 
+    if len(SPAM_TRACKER[author.id]) >= 5:
+        try:
+            await author.timeout(nextcord.utils.utcnow() + nextcord.utils.timedelta(seconds=30))
+            await author.send(bardock_msg("Rapid-fire messaging detected — calm your battle spirit."))
+        except:
+            pass
+        SPAM_TRACKER[author.id] = []
 
-# -----------------------
-# COMMANDS
-# -----------------------
-@bot.command()
-async def ping(ctx):
-    await ctx.reply("Bardock reporting — I'm online. ⚔️🔥")
+    await BOT.process_commands(message)
 
-
-@bot.command()
-@commands.has_permissions(moderate_members=True)
-async def untimeout(ctx, member: nextcord.Member):
-    try:
-        await member.edit(communication_disabled_until=None)
-        await ctx.send(f"{member.mention} has been released.")
-    except:
-        await ctx.send("Couldn't untimeout.")
-
-
-# -----------------------
-# FLASK SERVER
-# -----------------------
-app = Flask("bardock-bot")
+# -----------------------------
+# FLASK KEEP-ALIVE FOR RENDER
+# -----------------------------
+app = Flask(__name__)
 
 @app.route("/")
-def index():
-    return "Bardock Guardian Bot Running", 200
+def home():
+    return "BardockBot Running."
 
 def run_flask():
-    app.run(host="0.0.0.0", port=PORT)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
 
-# -----------------------
-# MAIN
-# -----------------------
-def main():
-    if TOKEN is None:
-        log.error("TOKEN missing.")
-        return
+threading.Thread(target=run_flask).start()
 
-    t = Thread(target=run_flask)
-    t.daemon = True
-    t.start()
+# -----------------------------
+# RUN BOT
+# -----------------------------
+if TOKEN is None:
+    raise Exception("TOKEN environment variable missing!")
 
-    bot.run(TOKEN)
-
-if __name__ == "__main__":
-    main()
+BOT.run(TOKEN)
